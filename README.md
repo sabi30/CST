@@ -1,4 +1,4 @@
-# CST / Downforce Studio C & C++ Standard Library
+# CST / C & C++ Standard Library ((Downforce Studio))
 **Version:** 0.0.0
 
 **CST** is an unified, lightweight C and C++ Library.
