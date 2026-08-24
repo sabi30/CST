@@ -9,7 +9,7 @@
 * **Unified Cross-Platform API:** Fixing the API gap between Windows and POSIX
 * **Custom User-Defined Implementations:** Custom Allocators, Custom Operators
 
-### STATUS
+### Status
 * **C++ Status:** Active, full priority.
 * **C Status:** Closed, Coming soon. ( why: I will downgrade the C++ functions to C functions, this means C Status will be active after C++ has a full version )
 
