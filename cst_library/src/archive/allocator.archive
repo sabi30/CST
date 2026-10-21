@@ -1,0 +1,309 @@
+#include "mem.h"
+#include "macro.h"
+#include "mem_util.h"
+
+#include "io.h"
+
+/* my new allocator method  */
+
+// const variables
+#define TINY_BIN 128U
+#define SMALL_BIN 4096U
+#define MEDIUM_BIN 8192U
+#define LARGE_BIN 16384U
+#define MASSIVE_BIN 165536U
+
+#define TINY_CONTAINER_SIZE (128U * 1024U)
+#define MED_CONTAINER_SIZE  (1U * 1024U * 1024U)
+#define HUGE_CONTAINER_SIZE  (20U * 1024U * 1024U)
+
+#define TYPE_ERROR 255
+#define TYPE_CONTAINER_TINY 0U
+#define TYPE_CONTAINER_MED 1U
+#define TYPE_CONTAINER_HUGE 2U
+
+#define TINY_CONTAINER_INIT_COUNT 2
+#define MED_CONTAINER_INIT_COUNT 1
+#define HIGH_CONTAINER_INIT_COUNT 1
+
+// structs
+struct sBin {   
+    sBin *next;
+    void *container;
+};
+
+#define TINY_CONTAINER_BIN_COUNT (TINY_CONTAINER_SIZE / sizeof(sBin))
+#define MED_CONTAINER_BIN_COUNT (MED_CONTAINER_SIZE / sizeof(sBin))
+#define HUGE_CONTAINER_BIN_COUNT (HUGE_CONTAINER_SIZE / sizeof(sBin))
+
+struct sContainer {
+    sBin *free_bin;
+    
+    void *memory;
+    u32 size;    
+    u32 used;
+    u32 algo_free_track;
+    u8 type;
+    
+    sContainer *next;
+    sContainer *prev;
+};
+
+// data 
+namespace {
+    u32 SIZE_CONTAINER_LUT[3] {
+        TINY_CONTAINER_SIZE, MED_CONTAINER_SIZE, HUGE_CONTAINER_SIZE
+    };
+
+    u32 TYPE_TO_BIN_SIZE[3] {
+        SMALL_BIN, MEDIUM_BIN, MASSIVE_BIN
+    };
+
+    sContainer *main_container = nullptr;
+    sContainer *last_container = nullptr;
+    sContainer *free_containers[3];
+}
+
+static u8 get_type(dint size) {
+    if (size <= SMALL_BIN) return TYPE_CONTAINER_TINY;
+    if (size <= MEDIUM_BIN) return TYPE_CONTAINER_MED;
+    if (size <= MASSIVE_BIN) return TYPE_CONTAINER_HUGE;
+    return TYPE_ERROR;
+} 
+
+static sContainer *__create_container(u8 type) {
+    sContainer *container = nullptr;
+
+    switch (type) {
+        case TYPE_CONTAINER_TINY: 
+            container = static_cast<sContainer*>(cst::mmap(sizeof(sContainer) + TINY_CONTAINER_SIZE));
+            container->size = TINY_CONTAINER_BIN_COUNT;
+            container->memory = container + 1;
+            container->type = type;
+            break;
+        case TYPE_CONTAINER_MED:
+            container = static_cast<sContainer*>(cst::mmap(sizeof(sContainer) + MED_CONTAINER_SIZE));
+            container->size = MED_CONTAINER_BIN_COUNT;
+            container->memory = container + 1;
+            container->type = type;
+            break;
+        case TYPE_CONTAINER_HUGE:
+            container = static_cast<sContainer*>(cst::mmap(sizeof(sContainer) + HUGE_CONTAINER_SIZE));
+            container->size = HUGE_CONTAINER_BIN_COUNT;
+            container->memory = container + 1;
+            container->type = type;
+    }
+    
+    return container;
+}
+
+static void __init_bins(sContainer *container) {
+    if (!container) return;
+
+    u32 stride = 0;
+    switch (container->type) {
+        case TYPE_CONTAINER_TINY:
+            stride = SMALL_BIN;
+            break;
+        case TYPE_CONTAINER_MED:
+            stride = LARGE_BIN;
+            break;
+        case TYPE_CONTAINER_HUGE:
+            stride = MASSIVE_BIN;
+            break;
+    }
+
+    u8 *memory_space = static_cast<u8*>(container->memory);
+    stride += sizeof(sBin);
+
+    sBin *prev_bin = nullptr;
+    
+    u64 i = 0;
+    u64 future_i = stride;
+    while (future_i < SIZE_CONTAINER_LUT[container->type] && SIZE_CONTAINER_LUT[container->type] - future_i >= TYPE_TO_BIN_SIZE[container->type]) {
+        sBin *bin = reinterpret_cast<sBin*>(memory_space + i);
+        bin->container = container;
+        bin->next = nullptr;
+        if (prev_bin) {
+            prev_bin->next = bin;
+        }
+        prev_bin = bin;
+        i += stride;
+        future_i = i + stride;
+    }
+
+    container->free_bin = reinterpret_cast<sBin*>(memory_space);
+}
+
+static sContainer *__new_container(u8 type) {
+    sContainer *container = __create_container(type);
+    __init_bins(container);
+
+    //cst::print("NEW CONTAINER %p\n", container);
+    return container;
+}
+
+static void __destroy_container(sContainer *container) {
+    //cst::print("DESTROY CONTAINER %p\n", container);
+    if (container->prev) container->prev->next = container->next;
+    if (container->next) container->next->prev = container->prev;
+    cst::unmap(container, sizeof(sContainer) + SIZE_CONTAINER_LUT[container->type]);
+}
+
+static sContainer *__sp_container(u8 type) {
+    sContainer *new_container = __new_container(type);
+    if (likely(last_container)) { 
+        new_container->prev = last_container;
+        last_container->next = new_container;
+    } else {
+        main_container = new_container;
+    }
+    
+    last_container = new_container;
+
+    free_containers[type] = new_container;
+    return new_container;
+}
+
+void *cst::malloc(dint size) {
+    u8 container_type = get_type(size);
+    sContainer *container = free_containers[container_type];
+
+    if (unlikely(!container)) {
+        container = __sp_container(container_type);
+    }
+
+    if (unlikely(!container->free_bin)) {
+        container = __sp_container(container_type);
+    }
+
+    sBin *bin = container->free_bin;
+    container->free_bin = bin->next;
+    container->used++;
+
+    if (unlikely(container->used > container->size)) {
+        __sp_container(container_type);
+        free_containers[container_type] = container;
+    }
+    
+    return bin + 1;
+}
+
+void cst::free(void *ptr) {
+    if (!ptr) return;
+    sBin *bin = reinterpret_cast<sBin*>(ptr) - 1;
+    sContainer *container = reinterpret_cast<sContainer*>(bin->container);
+
+    container->used--;
+
+    bin->next = container->free_bin;
+    container->free_bin = bin;
+
+    if (unlikely(container->algo_free_track > 50 && container->used == 0)) {
+        if (last_container == container) { 
+            if (container->next) {
+                last_container = container->next;
+            } 
+            else last_container = container->prev; 
+        }
+        __destroy_container(container);
+        return;
+    }
+
+    if (unlikely(!free_containers[container->type])) {
+        free_containers[container->type] = container;
+    }
+    
+    if (unlikely(free_containers[container->type]->used < container->used)) {
+        free_containers[container->type] = container;
+    }
+}
+
+void *cst::realloc(void *ptr, dint size) {   
+    if (!size) return nullptr;
+    if (!ptr) return malloc(size);
+
+    sBin *bin = static_cast<sBin*>(ptr) - 1;
+    sContainer *container = static_cast<sContainer*>(bin->container);
+
+    void *new_ptr = malloc(size);
+    if (!new_ptr) {
+        return nullptr;
+    }
+
+    dint copy_size = size;
+    if (container->size < size) copy_size = container->size;
+    
+    memcpy(new_ptr, ptr, copy_size);
+    return new_ptr;
+}
+
+void cst::pre_alloc() {
+    for (dint i = 0; i < TINY_CONTAINER_INIT_COUNT; i++) {
+        sContainer *container = static_cast<sContainer*>(__new_container(TYPE_CONTAINER_TINY));
+        if (!main_container) {
+            main_container = container;
+            last_container = main_container;
+            continue;
+        }
+
+        if (last_container) {
+            container->prev = last_container;
+        }
+
+        last_container->next = container;
+        //last_container = container;
+        free_containers[TYPE_CONTAINER_TINY] = container;
+    }
+    
+    for (dint i = 0; i < MED_CONTAINER_INIT_COUNT; i++) {
+        sContainer *container = static_cast<sContainer*>(__new_container(TYPE_CONTAINER_MED));
+        if (!main_container) {
+            main_container = container;
+            last_container = main_container;
+            continue;
+        }
+
+        if (last_container) {
+            container->prev = last_container;
+        }
+
+        last_container->next = container;
+        //last_container = container;
+        free_containers[TYPE_CONTAINER_MED] = container;
+    } 
+    
+    for (dint i = 0; i < HIGH_CONTAINER_INIT_COUNT; i++) {
+        sContainer *container = static_cast<sContainer*>(__new_container(TYPE_CONTAINER_HUGE));
+        if (!main_container) {
+            main_container = container;
+            last_container = main_container;
+            continue;
+        }
+
+        if (last_container) {
+            container->prev = last_container;
+        }
+
+        last_container->next = container;
+        //last_container = container;
+        free_containers[TYPE_CONTAINER_HUGE] = container;
+    }  
+}
+
+void cst::clear_memory() {
+    sContainer *current = main_container;
+    while (current) {
+        sContainer *con = current;
+        current = current->next;
+        __destroy_container(con);
+    }
+}
+
+// public 
+
+namespace cst {
+    void* (*galloc)(dint) = malloc;                 
+    void (*gfree)(void*) = free;                  
+    void *(*grealloc)(void*, dint) = realloc; 
+}
